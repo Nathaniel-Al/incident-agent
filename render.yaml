@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: incident-agent
+    runtime: docker
+    plan: starter            # free tier sleeps after 15 min idle -> cold start can fail a Check
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: AIPIPE_TOKEN
+        sync: false
+      - key: DEBUG_TOKEN
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://aipipe.org/openai/v1
+      - key: LLM_MODEL
+        value: gpt-4.1-mini
+      - key: LLM_FALLBACK_MODEL
+        value: ""
+      - key: LLM_TIMEOUT_S
+        value: "14"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_BODIES
+        value: "0"
+      - key: DATA_DIR
+        value: /tmp/incident-agent
