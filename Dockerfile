@@ -10,4 +10,4 @@ COPY app ./app
 
 EXPOSE 10000
 # One worker on purpose: per-run locks live in process memory.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1 --log-level info --proxy-headers --forwarded-allow-ips='*'"]
+CMD ["sh", "-c", "uvicorn app.asgi:application --host 0.0.0.0 --port ${PORT:-10000} --workers 1 --log-level info --proxy-headers --forwarded-allow-ips='*'"]
