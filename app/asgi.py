@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import time
 from collections import deque
@@ -14,6 +15,10 @@ _entries = deque(maxlen=40)
 _seq = 0
 _SECRET_HDRS = {"authorization", "cookie", "proxy-authorization", "x-api-key"}
 _MAX_CAP = 400_000
+_CHUNK = 6000
+_CAP_DIR = os.path.join(settings.data_dir, "captures")
+os.makedirs(_CAP_DIR, exist_ok=True)
+_BOOT = time.strftime("%H%M%S")
 
 
 def _sens_values(obj, out):
@@ -33,6 +38,20 @@ def _parse(raw: bytes):
         return json.loads(raw)
     except Exception:
         return raw[:2000].decode("utf-8", "replace")
+
+
+def _persist(entry: dict):
+    """Survive restarts: chunked log lines (retained by Render) plus a local file."""
+    cap_id = f"{_BOOT}-{entry['seq']}"
+    try:
+        text = json.dumps(entry, default=str, separators=(",", ":"))
+        parts = [text[i:i + _CHUNK] for i in range(0, len(text), _CHUNK)] or [""]
+        for i, p in enumerate(parts, 1):
+            print(f"CAPTURE id={cap_id} part={i}/{len(parts)} {p}", flush=True)
+        with open(os.path.join(_CAP_DIR, f"{cap_id}.json"), "w") as f:
+            f.write(text)
+    except Exception:
+        log.exception("persist_failed")
 
 
 async def _json(send, status, obj):
@@ -131,6 +150,7 @@ async def application(scope, receive, send):
                 "response": _parse(resp_raw),
             }
             _entries.append(entry)
+            _persist(entry)
             log.info("capture seq=%d %s %s -> %s req=%dB resp=%dB %dms leak=%s",
                      _seq, scope.get("method"), path, state["status"],
                      state["req"], state["resp"], entry["ms"], leak)
