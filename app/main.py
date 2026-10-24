@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -19,7 +20,10 @@ from .util import (ApiError, canon, parse_traceparent, scrub, sensitive_values,
 logging.basicConfig(
     level=getattr(logging, settings.log_level, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stdout,
+    force=True,
 )
+print("incident-agent module loaded", flush=True)
 log = logging.getLogger("incident")
 
 store = Store(os.path.join(settings.data_dir, "runs.db"))
@@ -53,17 +57,19 @@ async def api_error_handler(request: Request, exc: ApiError):
 @app.middleware("http")
 async def access_log(request: Request, call_next):
     t0 = time.monotonic()
+    if request.url.path != "/healthz":
+        log.info("http_in %s %s host=%s clen=%s ctype=%s traceparent=%s",
+                 request.method, request.url.path, request.headers.get("host"),
+                 request.headers.get("content-length"), request.headers.get("content-type"),
+                 request.headers.get("traceparent"))
     try:
         resp = await call_next(request)
     except Exception:
         log.exception("unhandled %s %s", request.method, request.url.path)
         resp = JSONResponse({"error": "internal_error"}, status_code=500)
     if request.url.path != "/healthz":
-        log.info("http %s %s -> %s %dms clen=%s ctype=%s traceparent=%s",
-                 request.method, request.url.path, resp.status_code,
-                 int((time.monotonic() - t0) * 1000),
-                 request.headers.get("content-length"), request.headers.get("content-type"),
-                 "yes" if request.headers.get("traceparent") else "no")
+        log.info("http_out %s %s -> %s %dms", request.method, request.url.path,
+                 resp.status_code, int((time.monotonic() - t0) * 1000))
     return resp
 
 
@@ -110,26 +116,29 @@ def _validate_create(req: dict):
 
 
 def _log_create_input(req: dict, size: int, request: Request):
-    inc, pol = req.get("incident", {}), req.get("policy", {})
+    inc = req.get("incident") if isinstance(req.get("incident"), dict) else {}
+    pol = req.get("policy") if isinstance(req.get("policy"), dict) else {}
     tr = inc.get("transcript", "") if isinstance(inc.get("transcript"), str) else ""
+    sens = req.get("sensitive")
     summary = dict(
         runId=req.get("runId"), profile=req.get("profile"), incidentId=inc.get("incidentId"),
         service=inc.get("service"), sev=inc.get("severity"), bytes=size,
         transcript_lines=tr.count("\n") + 1, transcript_chars=len(tr),
         roots=len(inc.get("allowedRootCauses", []) or []),
-        tools=len(req.get("toolCatalog", []) or []),
+        tools=len(req.get("toolCatalog", []) or []) if isinstance(req.get("toolCatalog"), list) else None,
         maxDiag=pol.get("maximumDiagnostics"), effectTools=pol.get("effectTools"),
         approvalFor=pol.get("approvalRequiredFor"),
-        sensitive_keys=list((req.get("sensitive") or {}).keys()) if isinstance(req.get("sensitive"), dict) else None,
+        sensitive_keys=list(sens.keys()) if isinstance(sens, dict) else None,
         incoming_traceparent=bool(request.headers.get("traceparent")),
     )
     log.info("create_in %s", json.dumps(summary, default=str))
-    _note("create_in", **{k: summary[k] for k in ("runId", "incidentId", "bytes", "effectTools")})
+    _note("create_in", runId=summary["runId"], incidentId=summary["incidentId"],
+          bytes=summary["bytes"], effectTools=summary["effectTools"])
     if settings.log_bodies:
         red = json.loads(json.dumps(req))
         if isinstance(red.get("sensitive"), dict):
             red["sensitive"] = {k: "[REDACTED]" for k in red["sensitive"]}
-        if isinstance(red.get("incident", {}).get("transcript"), str):
+        if isinstance(red.get("incident"), dict) and isinstance(red["incident"].get("transcript"), str):
             red["incident"]["transcript"] = red["incident"]["transcript"][:400] + "...[truncated]"
         log.info("create_body %s", json.dumps(red, default=str)[:6000])
 
@@ -217,8 +226,27 @@ async def get_incident(run_id: str):
     return _respond(row[1], row[2])
 
 
-@app.get("/debug/recent")
-async def debug_recent(request: Request):
+def _debug_auth(request: Request):
     if not settings.debug_token or request.headers.get("x-debug-token") != settings.debug_token:
         raise ApiError(404, "not_found")
+
+
+@app.get("/debug/recent")
+async def debug_recent(request: Request):
+    _debug_auth(request)
     return list(recent)
+
+
+@app.get("/debug/llm")
+async def debug_llm(request: Request):
+    _debug_auth(request)
+    t0 = time.monotonic()
+    try:
+        content, usage = await llm._chat(
+            request.app.state.http, settings.llm_model,
+            [{"role": "user", "content": 'Reply with the JSON object {"ok": true}'}], 10)
+        return {"ok": True, "model": settings.llm_model, "ms": int((time.monotonic() - t0) * 1000),
+                "reply": content[:100], "usage": usage}
+    except Exception as e:
+        return {"ok": False, "model": settings.llm_model, "error": type(e).__name__,
+                "status": getattr(e, "status", None), "token_set": bool(settings.aipipe_token)}
