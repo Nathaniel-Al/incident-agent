@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+import traceback
 
 from jsonschema import validators
 
@@ -34,6 +35,12 @@ class PlanError(Exception):
     pass
 
 
+class LlmHttpError(Exception):
+    def __init__(self, status: int):
+        super().__init__(f"llm http {status}")
+        self.status = status
+
+
 def evidence_ids(transcript: str) -> set:
     return set(_EV.findall(transcript))
 
@@ -45,10 +52,14 @@ def build_messages(req: dict):
         {"name": t.get("name"), "description": t.get("description"), "inputSchema": t.get("inputSchema")}
         for t in req["toolCatalog"]
     ]
+    try:
+        max_d = min(3, int(pol.get("maximumDiagnostics", 3) or 3))
+    except Exception:
+        max_d = 3
     user = (
         f"INCIDENT: {inc.get('incidentId')} | {inc.get('title')} | service={inc.get('service')} | {inc.get('severity')}\n"
         f"ALLOWED_ROOT_CAUSES: {json.dumps(inc['allowedRootCauses'])}\n"
-        f"MAX_DIAGNOSTICS: {min(3, int(pol.get('maximumDiagnostics', 3) or 3))}\n"
+        f"MAX_DIAGNOSTICS: {max_d}\n"
         f"EFFECT_TOOLS: {json.dumps(pol.get('effectTools', []))}\n"
         f"APPROVAL_REQUIRED_FOR: {json.dumps(pol.get('approvalRequiredFor', []))}\n"
         f"TOOL_CATALOG: {json.dumps(catalog)}\n"
@@ -59,20 +70,21 @@ def build_messages(req: dict):
 
 async def _chat(client, model, messages, timeout):
     t0 = time.monotonic()
-    r = await client.post(
-        f"{settings.llm_base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {settings.aipipe_token}"},
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-        },
-        timeout=timeout,
-    )
+    url = f"{settings.llm_base_url}/chat/completions"
+    headers = {"Authorization": f"Bearer {settings.aipipe_token}"}
+    r = None
+    for use_fmt in (True, False):
+        body = {"model": model, "messages": messages, "temperature": 0}
+        if use_fmt:
+            body["response_format"] = {"type": "json_object"}
+        r = await client.post(url, headers=headers, json=body, timeout=timeout)
+        if r.status_code == 400 and use_fmt:
+            log.warning("llm_400_retry_without_response_format model=%s body=%.300s", model, r.text)
+            continue
+        break
     if r.status_code >= 400:
-        log.warning("llm_http_error model=%s status=%s body=%.300s", model, r.status_code, r.text)
-        r.raise_for_status()
+        log.error("llm_http_error model=%s status=%s body=%.300s", model, r.status_code, r.text)
+        raise LlmHttpError(r.status_code)
     data = r.json()
     content = data["choices"][0]["message"]["content"]
     usage = data.get("usage") or {}
@@ -85,7 +97,7 @@ async def _chat(client, model, messages, timeout):
 
 
 def _parse(content: str) -> dict:
-    s = content.strip()
+    s = (content or "").strip()
     s = re.sub(r"^```(?:json)?|```$", "", s, flags=re.M).strip()
     try:
         obj = json.loads(s)
@@ -120,10 +132,10 @@ def _check_args(tool: dict, args):
         cls = validators.validator_for(schema)
         cls(schema).validate(args)
     except Exception as e:  # ValidationError or SchemaError
-        msg = getattr(e, "message", "schema mismatch")
         if type(e).__name__ == "SchemaError":
             return
-        raise PlanError(f"arguments for {tool.get('name')} violate inputSchema: {msg[:200]}")
+        msg = getattr(e, "message", "schema mismatch")
+        raise PlanError(f"arguments for {tool.get('name')} violate inputSchema: {str(msg)[:200]}")
 
 
 def validate_plan(raw: dict, req: dict, valid_ids: set) -> dict:
@@ -137,7 +149,10 @@ def validate_plan(raw: dict, req: dict, valid_ids: set) -> dict:
 
     catalog = {t["name"]: t for t in req["toolCatalog"]}
     effect_tools = set(pol.get("effectTools", []))
-    max_d = max(1, min(3, int(pol.get("maximumDiagnostics", 3) or 3)))
+    try:
+        max_d = max(1, min(3, int(pol.get("maximumDiagnostics", 3) or 3)))
+    except Exception:
+        max_d = 3
 
     diags, seen = [], set()
     for d in raw.get("diagnostics") or []:
@@ -172,15 +187,21 @@ def validate_plan(raw: dict, req: dict, valid_ids: set) -> dict:
 
 async def make_plan(client, req: dict, budget_s: float) -> dict:
     t_end = time.monotonic() + budget_s
+    if not settings.aipipe_token:
+        log.error("planner: AIPIPE_TOKEN is not set in the Render environment")
+        raise ApiError(502, "planner_failed_no_token")
     ids = evidence_ids(req["incident"]["transcript"])
+    log.info("planner: evidence_ids_found=%d", len(ids))
     messages = build_messages(req)
     models = [settings.llm_model] + ([settings.llm_fallback_model] if settings.llm_fallback_model else [])
     start_ns = time.time_ns()
+    reason = "no_budget"
 
     for model in models:
         for _ in range(2):  # one repair attempt on invalid output
             remaining = t_end - time.monotonic()
-            if remaining < 4:
+            if remaining < 3:
+                reason = "no_budget"
                 break
             content = ""
             try:
@@ -189,12 +210,18 @@ async def make_plan(client, req: dict, budget_s: float) -> dict:
                 plan.update(model=model, startNs=start_ns, endNs=time.time_ns(), usage=usage)
                 return plan
             except PlanError as e:
-                log.warning("plan_invalid model=%s reason=%s", model, e)
+                reason = "invalid_plan"
+                log.warning("plan_invalid model=%s reason=%s raw=%.300s", model, e, content)
                 messages = messages + [
                     {"role": "assistant", "content": content or "{}"},
                     {"role": "user", "content": f"Invalid: {e}. Return the corrected JSON object only."},
                 ]
-            except Exception as e:
-                log.warning("llm_call_failed model=%s err=%s", model, type(e).__name__)
+            except LlmHttpError as e:
+                reason = f"http_{e.status}"
                 break
-    raise ApiError(502, "planner_failed")
+            except Exception as e:
+                reason = type(e).__name__.lower()[:30]
+                log.error("llm_call_failed model=%s err=%s\n%s", model, type(e).__name__, traceback.format_exc())
+                break
+    log.error("planner_failed reason=%s", reason)
+    raise ApiError(502, f"planner_failed_{reason}")
