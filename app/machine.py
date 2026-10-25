@@ -220,15 +220,19 @@ def process_receipt(st: dict, body: dict, body_hash: str) -> bool:
 
 def render(st: dict) -> dict:
     waiting = st["status"] == "waiting"
-    return {
+    out = {
         "runId": st["runId"],
         "status": st["status"],
         "diagnosis": st["diagnosis"],
-        "chosenEffect": st["chosenEffect"],
-        "suppressed": st["suppressed"],
         "dispatches": st["newDispatches"] if waiting else [],
         "approvals": st["pendingApprovals"] if waiting else [],
         "actionLog": st["actionLog"],
         "receiptLog": st["receiptLog"],
         "otlp": build_otlp(st),
     }
+    if not waiting:
+        # Only a finished run names its effect; a waiting run must not announce
+        # an approval-gated action before the approval has been granted.
+        out["chosenEffect"] = st["chosenEffect"]
+        out["suppressed"] = st["suppressed"]
+    return out
